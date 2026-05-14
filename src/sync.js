@@ -2,15 +2,14 @@
 try { require('dotenv').config(); } catch (e) {}
 
 const { fetchOrders, fetchOrderItems, aggregateOrdersByMonthAndAsin } = require('./orders');
-const { getProducts, upsertMonthlySales, upsertMonthlyAds } = require('./db');
+const { getProducts, upsertMonthlySales, getMonthlySales } = require('./db');
 const { parseTSV } = require('./reports');
 
 async function syncOrders(daysBack = 60, log = console.log) {
   const start = Date.now();
 
-  // Verificar credenciales
   if (!process.env.AMAZON_CLIENT_ID || !process.env.AMAZON_REFRESH_TOKEN) {
-    log('❌ ERROR: Faltan credenciales de Amazon (AMAZON_CLIENT_ID o AMAZON_REFRESH_TOKEN)');
+    log('❌ ERROR: Faltan credenciales de Amazon');
     return { ok: false, error: 'Faltan credenciales de Amazon' };
   }
 
@@ -19,8 +18,6 @@ async function syncOrders(daysBack = 60, log = console.log) {
   const endDate   = new Date();
   const startDate = new Date();
   startDate.setDate(startDate.getDate() - daysBack);
-
-  log(`📅 Desde: ${startDate.toISOString().slice(0,10)} → ${endDate.toISOString().slice(0,10)}`);
 
   const products = getProducts();
   if (products.length === 0) {
@@ -32,77 +29,66 @@ async function syncOrders(daysBack = 60, log = console.log) {
   log(`📦 Productos: ${products.map(p => p.asin).join(', ')}`);
 
   try {
-    // 1. Descargar órdenes
     log('📥 Descargando órdenes de Amazon...');
     const orders = await fetchOrders(startDate, endDate, log);
-    log(`📥 ${orders.length} órdenes descargadas`);
+    log(`📥 ${orders.length} órdenes totales descargadas`);
 
     if (orders.length === 0) {
-      log('ℹ️ Sin órdenes en el período — puede ser normal si no hubo ventas');
-      return { ok: true, orders: 0, records: 0, message: 'Sin órdenes en el período' };
+      log('ℹ️ Sin órdenes en el período');
+      return { ok: true, orders: 0, records: 0 };
     }
 
-    // 2. Descargar items por lotes
-    log(`📥 Descargando items de ${orders.length} órdenes...`);
+    // Descargar items de forma secuencial
+    log(`📥 Descargando items...`);
     const orderItemsMap = {};
-    const BATCH = 3;
 
-    for (let i = 0; i < orders.length; i += BATCH) {
-      const batch = orders.slice(i, i + BATCH);
-      await Promise.all(batch.map(async (order) => {
-        try {
-          const items = await fetchOrderItems(order.AmazonOrderId);
-          orderItemsMap[order.AmazonOrderId] = items;
-        } catch (err) {
-          log(`⚠️ Items no disponibles para ${order.AmazonOrderId}: ${err.message}`);
-        }
-      }));
+    for (let i = 0; i < orders.length; i++) {
+      const order = orders[i];
+      const items = await fetchOrderItems(order.AmazonOrderId, log);
+      orderItemsMap[order.AmazonOrderId] = items;
 
-      if (i % 30 === 0 && i > 0) {
-        log(`📥 Progreso: ${Math.min(i+BATCH, orders.length)}/${orders.length}`);
+      if ((i + 1) % 10 === 0) {
+        log(`📥 Items: ${i + 1}/${orders.length}`);
       }
     }
 
-    // 3. Agregar por mes y ASIN
     const aggregated = aggregateOrdersByMonthAndAsin(orders, orderItemsMap);
-    log(`📊 Meses con datos: ${Object.keys(aggregated).join(', ') || 'ninguno'}`);
+    log(`📊 Meses: ${Object.keys(aggregated).join(', ') || 'ninguno'}`);
 
-    // 4. Guardar en BD
+    // Guardar en BD — SIN sobreescribir datos de PPC introducidos manualmente
     let savedRecords = 0;
     for (const [month, asins] of Object.entries(aggregated)) {
       for (const [asin, data] of Object.entries(asins)) {
         const product = asinMap[asin];
-        if (!product) {
-          log(`⚠️ ASIN ${asin} no encontrado en BD, ignorando`);
-          continue;
-        }
+        if (!product) continue;
+
+        // Leer datos existentes para preservar storage_fee
+        const existing = getMonthlySales(product.id, month) || {};
+
         upsertMonthlySales({
           product_id:     product.id,
           month,
-          units_organic:  data.units,
-          units_returned: data.returns,
+          units_organic:  data.units,      // Total unidades vendidas (ads + orgánicas)
+          units_returned: data.returns,    // Devoluciones/cancelaciones
           revenue:        data.revenue,
-          storage_fee:    0,
+          storage_fee:    existing.storage_fee || 0,  // Preservar storage fee manual
         });
-        log(`✅ Guardado: ${product.name} — ${month} — ${data.units} uds`);
+
+        log(`✅ ${product.name} — ${month} — ${data.units} uds vendidas, ${data.returns} devueltas`);
         savedRecords++;
       }
     }
 
     const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-    log(`✅ Sincronización completada en ${elapsed}s — ${savedRecords} registros guardados`);
+    log(`✅ Completado en ${elapsed}s — ${savedRecords} registros`);
 
     return { ok: true, orders: orders.length, records: savedRecords };
 
   } catch (err) {
-    log(`❌ Error en sincronización: ${err.message}`);
-
-    // Mostrar respuesta de Amazon si existe
+    log(`❌ Error: ${err.message}`);
     if (err.response) {
-      const body = JSON.stringify(err.response.data || {});
-      log(`❌ Respuesta Amazon: ${err.response.status} — ${body.slice(0, 200)}`);
+      log(`❌ Amazon: ${err.response.status} — ${JSON.stringify(err.response.data||{}).slice(0,200)}`);
     }
-
     return { ok: false, error: err.message };
   }
 }
@@ -125,6 +111,7 @@ async function importSponsoredProductsCSV(csvContent, month, log = console.log) 
       });
     }
 
+    const { getProducts, upsertMonthlyAds } = require('./db');
     const products = getProducts();
     const asinMap  = Object.fromEntries(products.map(p => [p.asin, p]));
     const byAsin   = {};
@@ -134,7 +121,6 @@ async function importSponsoredProductsCSV(csvContent, month, log = console.log) 
       if (!asin || !asinMap[asin]) continue;
 
       if (!byAsin[asin]) byAsin[asin] = { units_ads:0, ppc_spend:0, impressions:0, clicks:0 };
-
       byAsin[asin].units_ads   += Number(row['Units Sold']||row['7 Day Total Units']||row['Unidades vendidas en 7 días']||0);
       byAsin[asin].ppc_spend   += Number(row['Spend']||row['Gasto']||row['Total Spend']||0);
       byAsin[asin].impressions += Number(row['Impressions']||row['Impresiones']||0);
@@ -145,15 +131,15 @@ async function importSponsoredProductsCSV(csvContent, month, log = console.log) 
     for (const [asin, data] of Object.entries(byAsin)) {
       const product = asinMap[asin];
       upsertMonthlyAds({ product_id: product.id, month, ...data });
-      log(`✅ PPC actualizado: ${product.name} — Gasto: €${data.ppc_spend.toFixed(2)}`);
+      log(`✅ PPC: ${product.name} — €${data.ppc_spend.toFixed(2)} gasto, ${data.units_ads} uds ads`);
       saved++;
     }
 
-    log(`✅ CSV importado: ${saved} productos actualizados para ${month}`);
+    log(`✅ CSV importado: ${saved} productos para ${month}`);
     return { ok: true, saved, rows: rows.length };
 
   } catch (err) {
-    log(`❌ Error importando CSV: ${err.message}`);
+    log(`❌ Error CSV: ${err.message}`);
     return { ok: false, error: err.message };
   }
 }
