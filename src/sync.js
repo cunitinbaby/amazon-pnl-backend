@@ -1,100 +1,163 @@
-// ─── Sincronización Amazon SP-API ────────────────────────────────────────────
+// ─── Sincronización Amazon SP-API (incremental) ──────────────────────────────
 try { require('dotenv').config(); } catch (e) {}
 
 const { fetchOrders, fetchOrderItems, aggregateOrdersByMonthAndAsin } = require('./orders');
-const { getProducts, upsertMonthlySales, getMonthlySales } = require('./db');
+const db = require('./db');
 const { parseTSV } = require('./reports');
+const axios = require('axios');
+const { getHeaders } = require('./auth');
 
-async function syncOrders(daysBack = 60, log = console.log) {
+const BASE = process.env.AMAZON_ENDPOINT;
+const MKT  = process.env.AMAZON_MARKETPLACE_ID;
+
+// Auto-añadir productos nuevos detectados en las órdenes
+async function autoAddProduct(asin, log) {
+  try {
+    const headers = await getHeaders();
+    const res = await axios.get(`${BASE}/catalog/2022-04-01/items/${asin}`, {
+      headers,
+      params: { marketplaceIds: MKT, includedData: 'summaries,attributes' }
+    });
+
+    const summary = res.data.summaries?.[0] || {};
+    const title = summary.itemName || `Producto ${asin}`;
+
+    db.upsertProduct({
+      id:    'p_' + asin.toLowerCase(),
+      asin,
+      name:  title.slice(0, 60),
+      price: 0,  // El usuario debe completar
+      fees:  0,
+      cogs:  0,
+      color: '#A78BFA',
+    });
+
+    log(`🆕 Nuevo producto detectado: ${asin} — ${title.slice(0, 40)}`);
+    log(`⚠️ Completa precio, fees y COGS en la pestaña Productos`);
+    return true;
+  } catch (err) {
+    log(`⚠️ No se pudo añadir ${asin}: ${err.message}`);
+    // Añadir con datos vacíos
+    db.upsertProduct({
+      id:    'p_' + asin.toLowerCase(),
+      asin,
+      name:  `Producto ${asin}`,
+      price: 0, fees: 0, cogs: 0, color: '#A78BFA',
+    });
+    return false;
+  }
+}
+
+async function syncOrders(daysBack = null, log = console.log) {
   const start = Date.now();
 
   if (!process.env.AMAZON_CLIENT_ID || !process.env.AMAZON_REFRESH_TOKEN) {
     log('❌ ERROR: Faltan credenciales de Amazon');
-    return { ok: false, error: 'Faltan credenciales de Amazon' };
+    return { ok: false, error: 'Faltan credenciales' };
   }
 
-  log(`📅 Período: últimos ${daysBack} días`);
+  // SYNC INCREMENTAL: usar última sync + 1h overlap para no perder datos
+  let startDate;
+  const lastSync = db.getLastSyncDate();
 
-  const endDate   = new Date();
-  const startDate = new Date();
-  startDate.setDate(startDate.getDate() - daysBack);
-
-  const products = getProducts();
-  if (products.length === 0) {
-    log('❌ No hay productos en la base de datos');
-    return { ok: false, error: 'No hay productos en la BD' };
+  if (daysBack) {
+    // Sync forzado completo (primera vez o reset)
+    startDate = new Date();
+    startDate.setDate(startDate.getDate() - daysBack);
+    log(`📅 Sync completo: últimos ${daysBack} días`);
+  } else if (lastSync) {
+    // Sync incremental: desde última fecha - 1 hora de margen
+    startDate = new Date(lastSync);
+    startDate.setHours(startDate.getHours() - 1);
+    log(`⚡ Sync incremental desde: ${startDate.toISOString().slice(0, 16)}`);
+  } else {
+    // Primera sync: últimos 60 días
+    startDate = new Date();
+    startDate.setDate(startDate.getDate() - 60);
+    log(`📅 Primera sync: últimos 60 días`);
   }
 
-  const asinMap = Object.fromEntries(products.map(p => [p.asin, p]));
-  log(`📦 Productos: ${products.map(p => p.asin).join(', ')}`);
+  const endDate = new Date();
 
   try {
-    log('📥 Descargando órdenes de Amazon...');
+    log('📥 Descargando órdenes...');
     const orders = await fetchOrders(startDate, endDate, log);
-    log(`📥 ${orders.length} órdenes totales descargadas`);
+    log(`📥 ${orders.length} órdenes descargadas`);
 
     if (orders.length === 0) {
-      log('ℹ️ Sin órdenes en el período');
+      db.setLastSyncDate(endDate.toISOString());
+      log('ℹ️ Sin órdenes nuevas');
       return { ok: true, orders: 0, records: 0 };
     }
 
-    // Descargar items de forma secuencial
-    log(`📥 Descargando items...`);
+    // Detectar ASINs en las órdenes
+    log(`📥 Descargando items (1 cada 2.1s)...`);
     const orderItemsMap = {};
+    const allAsins = new Set();
 
     for (let i = 0; i < orders.length; i++) {
       const order = orders[i];
       const items = await fetchOrderItems(order.AmazonOrderId, log);
       orderItemsMap[order.AmazonOrderId] = items;
+      items.forEach(it => it.ASIN && allAsins.add(it.ASIN));
 
       if ((i + 1) % 10 === 0) {
         log(`📥 Items: ${i + 1}/${orders.length}`);
       }
     }
 
-    const aggregated = aggregateOrdersByMonthAndAsin(orders, orderItemsMap);
-    log(`📊 Meses: ${Object.keys(aggregated).join(', ') || 'ninguno'}`);
+    // Auto-añadir productos nuevos
+    const existingAsins = new Set(db.getProducts().map(p => p.asin));
+    const newAsins = [...allAsins].filter(a => !existingAsins.has(a));
 
-    // Guardar en BD — SIN sobreescribir datos de PPC introducidos manualmente
+    if (newAsins.length > 0) {
+      log(`🆕 ${newAsins.length} ASIN(s) nuevo(s) detectado(s)`);
+      for (const asin of newAsins) {
+        await autoAddProduct(asin, log);
+      }
+    }
+
+    // Agregar y guardar
+    const products = db.getProducts();
+    const asinMap = Object.fromEntries(products.map(p => [p.asin, p]));
+    const aggregated = aggregateOrdersByMonthAndAsin(orders, orderItemsMap);
+
     let savedRecords = 0;
     for (const [month, asins] of Object.entries(aggregated)) {
       for (const [asin, data] of Object.entries(asins)) {
         const product = asinMap[asin];
         if (!product) continue;
 
-        // Leer datos existentes para preservar storage_fee
-        const existing = getMonthlySales(product.id, month) || {};
+        const existing = db.getMonthlySales(product.id, month) || {};
 
-        upsertMonthlySales({
+        db.upsertMonthlySales({
           product_id:     product.id,
           month,
-          units_organic:  data.units,      // Total unidades vendidas (ads + orgánicas)
-          units_returned: data.returns,    // Devoluciones/cancelaciones
-          revenue:        data.revenue,
-          storage_fee:    existing.storage_fee || 0,  // Preservar storage fee manual
+          units_organic:  Math.max(existing.units_organic || 0, data.units),
+          units_returned: Math.max(existing.units_returned || 0, data.returns),
+          revenue:        Math.max(existing.revenue || 0, data.revenue),
+          storage_fee:    existing.storage_fee || 0,
         });
-
-        log(`✅ ${product.name} — ${month} — ${data.units} uds vendidas, ${data.returns} devueltas`);
         savedRecords++;
       }
     }
 
-    const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-    log(`✅ Completado en ${elapsed}s — ${savedRecords} registros`);
+    db.setLastSyncDate(endDate.toISOString());
 
-    return { ok: true, orders: orders.length, records: savedRecords };
+    const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+    log(`✅ Sync completado en ${elapsed}s — ${savedRecords} registros`);
+
+    return { ok: true, orders: orders.length, records: savedRecords, newProducts: newAsins.length };
 
   } catch (err) {
     log(`❌ Error: ${err.message}`);
-    if (err.response) {
-      log(`❌ Amazon: ${err.response.status} — ${JSON.stringify(err.response.data||{}).slice(0,200)}`);
-    }
+    if (err.response) log(`❌ Amazon: ${err.response.status} — ${JSON.stringify(err.response.data||{}).slice(0,200)}`);
     return { ok: false, error: err.message };
   }
 }
 
 async function importSponsoredProductsCSV(csvContent, month, log = console.log) {
-  log(`📥 Importando CSV Sponsored Products para ${month}...`);
+  log(`📥 Importando CSV para ${month}...`);
 
   try {
     const isTSV = csvContent.includes('\t');
@@ -111,8 +174,7 @@ async function importSponsoredProductsCSV(csvContent, month, log = console.log) 
       });
     }
 
-    const { getProducts, upsertMonthlyAds } = require('./db');
-    const products = getProducts();
+    const products = db.getProducts();
     const asinMap  = Object.fromEntries(products.map(p => [p.asin, p]));
     const byAsin   = {};
 
@@ -130,12 +192,12 @@ async function importSponsoredProductsCSV(csvContent, month, log = console.log) 
     let saved = 0;
     for (const [asin, data] of Object.entries(byAsin)) {
       const product = asinMap[asin];
-      upsertMonthlyAds({ product_id: product.id, month, ...data });
-      log(`✅ PPC: ${product.name} — €${data.ppc_spend.toFixed(2)} gasto, ${data.units_ads} uds ads`);
+      db.upsertMonthlyAds({ product_id: product.id, month, ...data });
+      log(`✅ PPC: ${product.name} — €${data.ppc_spend.toFixed(2)}`);
       saved++;
     }
 
-    log(`✅ CSV importado: ${saved} productos para ${month}`);
+    log(`✅ CSV: ${saved} productos para ${month}`);
     return { ok: true, saved, rows: rows.length };
 
   } catch (err) {
@@ -145,7 +207,7 @@ async function importSponsoredProductsCSV(csvContent, month, log = console.log) 
 }
 
 if (require.main === module) {
-  syncOrders(parseInt(process.env.SYNC_DAYS_BACK)||60, console.log)
+  syncOrders(null, console.log)
     .then(r => { console.log('Resultado:', r); process.exit(r.ok?0:1); })
     .catch(err => { console.error(err); process.exit(1); });
 }

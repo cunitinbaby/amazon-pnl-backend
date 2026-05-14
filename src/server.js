@@ -68,7 +68,7 @@ app.post('/api/sync', requireAuth, async (req, res) => {
     return res.json({ ok: false, running: true, message: 'Sincronización ya en curso' });
   }
 
-  const { days = 60, wait = false } = req.body;
+  const { days = null, wait = false } = req.body;
 
   if (wait) {
     // Modo espera: ejecuta y devuelve resultado cuando termina
@@ -84,7 +84,11 @@ app.post('/api/sync', requireAuth, async (req, res) => {
 async function runSync(days) {
   syncStatus.running = true;
   syncStatus.lastError = null;
-  addLog(`▶ Iniciando sincronización (${days} días atrás)...`);
+  if (days === null) {
+    addLog(`▶ Sync incremental iniciado...`);
+  } else {
+    addLog(`▶ Sync completo (${days} días)...`);
+  }
 
   try {
     const result = await syncOrders(days, addLog);
@@ -262,14 +266,15 @@ app.listen(PORT, () => {
 
   initDefaultData();
 
-  // Cron automático cada noche a las 2am
-  const cronExpr = process.env.SYNC_CRON || '0 2 * * *';
+  // Cron automático cada 10 minutos (sync incremental)
+  const cronExpr = process.env.SYNC_CRON || '*/10 * * * *';
   try {
     cron.schedule(cronExpr, () => {
-      addLog('⏰ Cron: sincronización automática iniciada');
-      runSync(parseInt(process.env.SYNC_DAYS_BACK)||30);
+      if (syncStatus.running) return; // No solapar
+      addLog('⏰ Cron auto: sync incremental');
+      runSync(null); // null = incremental
     });
-    console.log(`⏰ Cron: ${cronExpr}`);
+    console.log(`⏰ Cron: ${cronExpr} (sync incremental cada 10 min)`);
   } catch(err) {
     console.error('Cron error:', err.message);
   }

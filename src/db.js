@@ -1,51 +1,39 @@
-// ─── Base de datos JSON simple ───────────────────────────────────────────────
-// Guarda todo en un archivo JSON. Sin dependencias nativas (Railway-friendly).
-
+// ─── Base de datos JSON ──────────────────────────────────────────────────────
 const fs   = require('fs');
 const path = require('path');
 
 const DATA_DIR  = path.join(__dirname, '..', 'data');
 const DATA_FILE = path.join(DATA_DIR, 'pnl.json');
-
-// Aseguramos que existe el directorio
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// Estructura por defecto
 const DEFAULT_DATA = {
-  products: [],
-  monthly_sales: {},   // { "productId__2026-04": {...} }
-  monthly_ads:   {},   // { "productId__2026-04": {...} }
-  fixed_costs:   [],
-  sync_log:      [],
+  products: [], monthly_sales: {}, monthly_ads: {},
+  fixed_costs: [], sync_log: [],
+  last_sync_date: null,
 };
 
-// Cargar datos
 function load() {
   try {
-    if (fs.existsSync(DATA_FILE)) {
-      return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    }
+    if (fs.existsSync(DATA_FILE)) return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
   } catch (err) {
-    console.error('[DB] Error cargando, usando default:', err.message);
+    console.error('[DB] Error cargando:', err.message);
   }
   return { ...DEFAULT_DATA };
 }
 
-// Guardar datos
 function save(data) {
-  try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-  } catch (err) {
-    console.error('[DB] Error guardando:', err.message);
-  }
+  try { fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2)); }
+  catch (err) { console.error('[DB] Error guardando:', err.message); }
 }
 
 let _data = load();
+// Asegurar campo last_sync_date
+if (!_data.last_sync_date) _data.last_sync_date = null;
+
+const _k = (pid, m) => `${pid}__${m}`;
 
 // ─── Productos ────────────────────────────────────────────────────────────────
-function getProducts() {
-  return [..._data.products].sort((a, b) => a.name.localeCompare(b.name));
-}
+const getProducts = () => [..._data.products].sort((a,b)=>a.name.localeCompare(b.name));
 
 function upsertProduct(p) {
   const idx = _data.products.findIndex(x => x.asin === p.asin);
@@ -60,31 +48,23 @@ function deleteProduct(id) {
 }
 
 // ─── Ventas mensuales ─────────────────────────────────────────────────────────
-function _salesKey(pid, month) { return `${pid}__${month}`; }
-
-function getMonthlySales(productId, month) {
-  return _data.monthly_sales[_salesKey(productId, month)] || null;
-}
+const getMonthlySales = (pid, m) => _data.monthly_sales[_k(pid, m)] || null;
 
 function upsertMonthlySales(d) {
-  _data.monthly_sales[_salesKey(d.product_id, d.month)] = d;
+  _data.monthly_sales[_k(d.product_id, d.month)] = d;
   save(_data);
 }
 
-// ─── Datos Ads ────────────────────────────────────────────────────────────────
-function getMonthlyAds(productId, month) {
-  return _data.monthly_ads[_salesKey(productId, month)] || null;
-}
+// ─── Ads ──────────────────────────────────────────────────────────────────────
+const getMonthlyAds = (pid, m) => _data.monthly_ads[_k(pid, m)] || null;
 
 function upsertMonthlyAds(d) {
-  _data.monthly_ads[_salesKey(d.product_id, d.month)] = d;
+  _data.monthly_ads[_k(d.product_id, d.month)] = d;
   save(_data);
 }
 
 // ─── Gastos fijos ─────────────────────────────────────────────────────────────
-function getFixedCosts() {
-  return _data.fixed_costs.filter(c => c.active !== false).sort((a, b) => a.name.localeCompare(b.name));
-}
+const getFixedCosts = () => _data.fixed_costs.filter(c => c.active !== false).sort((a,b)=>a.name.localeCompare(b.name));
 
 function upsertFixedCost(c) {
   const idx = _data.fixed_costs.findIndex(x => x.id === c.id);
@@ -94,8 +74,8 @@ function upsertFixedCost(c) {
 }
 
 function deleteFixedCost(id) {
-  const cost = _data.fixed_costs.find(c => c.id === id);
-  if (cost) cost.active = false;
+  const c = _data.fixed_costs.find(c => c.id === id);
+  if (c) c.active = false;
   save(_data);
 }
 
@@ -107,44 +87,41 @@ function getAvailableMonths() {
   return [...months].sort().reverse();
 }
 
-// ─── Datos completos de un mes ────────────────────────────────────────────────
+// ─── Datos de un mes ──────────────────────────────────────────────────────────
 function getMonthData(month) {
   const products = getProducts();
   const result   = {};
-
   for (const p of products) {
-    const sales = getMonthlySales(p.id, month) || {};
-    const ads   = getMonthlyAds(p.id, month)   || {};
-
+    const s = getMonthlySales(p.id, month) || {};
+    const a = getMonthlyAds(p.id, month)   || {};
     result[p.id] = {
       product:        p,
-      units_ads:      ads.units_ads      || 0,
-      units_organic:  sales.units_organic || 0,
-      units_returned: sales.units_returned || 0,
-      ppc_spend:      ads.ppc_spend      || 0,
-      storage_fee:    sales.storage_fee   || 0,
-      impressions:    ads.impressions    || 0,
-      clicks:         ads.clicks         || 0,
+      units_ads:      a.units_ads      || 0,
+      units_organic:  s.units_organic  || 0,
+      units_returned: s.units_returned || 0,
+      ppc_spend:      a.ppc_spend      || 0,
+      storage_fee:    s.storage_fee    || 0,
+      impressions:    a.impressions    || 0,
+      clicks:         a.clicks         || 0,
     };
   }
-
   return result;
 }
 
-// ─── Sync log ─────────────────────────────────────────────────────────────────
+// ─── Sync ─────────────────────────────────────────────────────────────────────
+const getLastSyncDate = () => _data.last_sync_date;
+function setLastSyncDate(iso) {
+  _data.last_sync_date = iso;
+  save(_data);
+}
+
 function logSync(type, status, message, records = 0) {
-  _data.sync_log.unshift({
-    type, status, message, records,
-    started_at: new Date().toISOString(),
-  });
-  // Mantener solo los últimos 100 logs
+  _data.sync_log.unshift({ type, status, message, records, started_at: new Date().toISOString() });
   _data.sync_log = _data.sync_log.slice(0, 100);
   save(_data);
 }
 
-function getLastSync(type) {
-  return _data.sync_log.find(l => l.type === type) || null;
-}
+const getLastSync = (type) => _data.sync_log.find(l => l.type === type) || null;
 
 module.exports = {
   getProducts, upsertProduct, deleteProduct,
@@ -153,4 +130,5 @@ module.exports = {
   getFixedCosts, upsertFixedCost, deleteFixedCost,
   getAvailableMonths, getMonthData,
   logSync, getLastSync,
+  getLastSyncDate, setLastSyncDate,
 };
