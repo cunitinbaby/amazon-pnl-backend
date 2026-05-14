@@ -1,113 +1,88 @@
-// ─── Amazon Orders API ────────────────────────────────────────────────────────
+// ─── Órdenes Amazon SP-API ────────────────────────────────────────────────────
 const axios = require('axios');
-const { getHeaders } = require('./auth');
+const { getAccessToken } = require('./auth');
 
-const BASE  = process.env.AMAZON_ENDPOINT;
-const MKT   = process.env.AMAZON_MARKETPLACE_ID;
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const BASE = process.env.AMAZON_ENDPOINT;
+const MKT  = process.env.AMAZON_MARKETPLACE_ID;
 
-async function fetchOrdersWithStatus(startDate, endDate, status, log = console.log) {
-  const headers = await getHeaders();
-  const orders  = [];
-  let nextToken = null;
-  let page      = 1;
+async function fetchOrders(startDate, endDate, log = console.log) {
+  try {
+    const headers = await getAccessToken();
+    const orders = [];
+    let nextToken = null;
 
-  const safeEnd = new Date(endDate.getTime() - 5 * 60 * 1000);
+    while (true) {
+      const params = {
+        CreatedAfter: startDate.toISOString(),
+        CreatedBefore: endDate.toISOString(),
+        OrderStatuses: ['Pending', 'Unshipped', 'PartiallyShipped', 'Shipped', 'Canceled', 'Unfulfillable'],
+        MaxResultsPerPage: 50,
+      };
+      if (nextToken) params.NextToken = nextToken;
 
-  do {
-    const params = {
-      MarketplaceIds: MKT,
-      CreatedAfter:   startDate.toISOString(),
-      CreatedBefore:  safeEnd.toISOString(),
-      OrderStatuses:  status,
-    };
-    if (nextToken) params.NextToken = nextToken;
-
-    try {
-      const res     = await axios.get(`${BASE}/orders/v0/orders`, { headers, params });
-      const payload = res.data.payload;
-      if (payload.Orders) orders.push(...payload.Orders);
-      nextToken = payload.NextToken || null;
-      log(`📄 [${status}] Página ${page}: ${payload.Orders?.length || 0} órdenes`);
-      page++;
-      await sleep(1100);
-    } catch (err) {
-      if (err.response?.status === 429) {
-        log(`⏳ Rate limit, esperando 10s...`);
-        await sleep(10000);
-      } else {
+      try {
+        const res = await axios.get(`${BASE}/orders/v0/orders`, { headers, params });
+        if (res.data.payload?.Orders) {
+          orders.push(...res.data.payload.Orders);
+        }
+        nextToken = res.data.payload?.NextToken;
+        if (!nextToken) break;
+      } catch (err) {
+        if (err.response?.status === 429) {
+          log('⏳ Rate limit — esperando 5s...');
+          await new Promise(r => setTimeout(r, 5000));
+          continue;
+        }
         throw err;
       }
     }
-  } while (nextToken);
 
-  return orders;
-}
-
-async function fetchOrders(startDate, endDate, log = console.log) {
-  log(`📥 Rango: ${startDate.toISOString().slice(0,10)} → ${new Date(endDate.getTime() - 5*60*1000).toISOString().slice(0,10)}`);
-
-  // Descargar órdenes enviadas/pendientes Y canceladas (devoluciones)
-  const [shipped, canceled] = await Promise.all([
-    fetchOrdersWithStatus(startDate, endDate, 'Shipped', log),
-    fetchOrdersWithStatus(startDate, endDate, 'Canceled', log),
-  ]);
-
-  log(`📥 Enviadas: ${shipped.length} | Canceladas/devueltas: ${canceled.length}`);
-
-  // Marcar las canceladas para identificarlas luego
-  canceled.forEach(o => o._isCanceled = true);
-
-  return [...shipped, ...canceled];
+    return orders;
+  } catch (err) {
+    log(`❌ fetchOrders: ${err.message}`);
+    throw err;
+  }
 }
 
 async function fetchOrderItems(orderId, log = console.log) {
-  const headers = await getHeaders();
-  await sleep(2100);
-
   try {
-    const res = await axios.get(`${BASE}/orders/v0/orders/${orderId}/orderItems`, { headers });
-    return res.data.payload.OrderItems || [];
+    const headers = await getAccessToken();
+    const res = await axios.get(`${BASE}/orders/v0/orders/${orderId}/orderitems`, { headers });
+    return res.data.payload?.OrderItems || [];
   } catch (err) {
-    if (err.response?.status === 429) {
-      log(`⏳ Rate limit items, esperando 5s...`);
-      await sleep(5000);
-      try {
-        const res2 = await axios.get(`${BASE}/orders/v0/orders/${orderId}/orderItems`, { headers });
-        return res2.data.payload.OrderItems || [];
-      } catch { return []; }
-    }
+    log(`⚠️ Items ${orderId}: ${err.message}`);
     return [];
   }
 }
 
-function aggregateOrdersByMonthAndAsin(orders, orderItemsMap) {
-  const result = {};
+function aggregateOrdersByDateAndAsin(orders, orderItemsMap) {
+  const byDateAsin = {}; // "2026-05-14::ASIN" -> {units, returns, revenue}
 
   for (const order of orders) {
-    const isCanceled = order._isCanceled || order.OrderStatus === 'Canceled';
-    const date  = new Date(order.PurchaseDate);
-    const month = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+    const date = order.PurchaseDate.slice(0, 10); // YYYY-MM-DD
     const items = orderItemsMap[order.AmazonOrderId] || [];
+    const isReturned = order.OrderStatus === 'Canceled';
 
     for (const item of items) {
       const asin = item.ASIN;
-      if (!result[month])       result[month] = {};
-      if (!result[month][asin]) result[month][asin] = { units: 0, revenue: 0, returns: 0 };
+      if (!asin) continue;
 
-      const qty = Number(item.QuantityOrdered || 0);
-      const price = Number(item.ItemPrice?.Amount || 0);
+      const key = `${date}::${asin}`;
+      if (!byDateAsin[key]) {
+        byDateAsin[key] = { units: 0, returns: 0, revenue: 0, date, asin };
+      }
 
-      if (isCanceled) {
-        result[month][asin].returns += qty;
+      const qty = item.QuantityOrdered - item.QuantityShipped;
+      if (isReturned) {
+        byDateAsin[key].returns += qty;
       } else {
-        result[month][asin].units   += qty;
-        result[month][asin].revenue += price;
+        byDateAsin[key].units += qty;
+        byDateAsin[key].revenue += (item.ItemPrice?.Amount || 0) * qty;
       }
     }
   }
 
-  return result;
+  return byDateAsin;
 }
 
-module.exports = { fetchOrders, fetchOrderItems, aggregateOrdersByMonthAndAsin };
+module.exports = { fetchOrders, fetchOrderItems, aggregateOrdersByDateAndAsin };

@@ -7,7 +7,7 @@ const DATA_FILE = path.join(DATA_DIR, 'pnl.json');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const DEFAULT_DATA = {
-  products: [], monthly_sales: {}, monthly_ads: {},
+  products: [], daily_sales: {}, monthly_ads: {},
   fixed_costs: [], sync_log: [],
   last_sync_date: null,
 };
@@ -27,10 +27,9 @@ function save(data) {
 }
 
 let _data = load();
-// Asegurar campo last_sync_date
 if (!_data.last_sync_date) _data.last_sync_date = null;
-
-const _k = (pid, m) => `${pid}__${m}`;
+if (!_data.daily_sales) _data.daily_sales = {};
+if (!_data.monthly_ads) _data.monthly_ads = {};
 
 // ─── Productos ────────────────────────────────────────────────────────────────
 const getProducts = () => [..._data.products].sort((a,b)=>a.name.localeCompare(b.name));
@@ -47,19 +46,60 @@ function deleteProduct(id) {
   save(_data);
 }
 
-// ─── Ventas mensuales ─────────────────────────────────────────────────────────
-const getMonthlySales = (pid, m) => _data.monthly_sales[_k(pid, m)] || null;
+// ─── Ventas diarias ──────────────────────────────────────────────────────────
+const getDailySales = (pid, date) => {
+  const key = `${pid}__${date}`;
+  return _data.daily_sales[key] || null;
+};
 
-function upsertMonthlySales(d) {
-  _data.monthly_sales[_k(d.product_id, d.month)] = d;
+function upsertDailySales(d) {
+  const key = `${d.product_id}__${d.date}`;
+  _data.daily_sales[key] = d;
   save(_data);
 }
 
-// ─── Ads ──────────────────────────────────────────────────────────────────────
-const getMonthlyAds = (pid, m) => _data.monthly_ads[_k(pid, m)] || null;
+// ─── Agregación por mes (para dashboard) ──────────────────────────────────────
+function getDailySalesByMonth(pid, month) {
+  const result = { units_organic: 0, units_returned: 0, revenue: 0, storage_fee: 0 };
+  const prefix = `${pid}__${month}`;
+  for (const [key, val] of Object.entries(_data.daily_sales)) {
+    if (key.startsWith(prefix)) {
+      result.units_organic  += val.units_organic || 0;
+      result.units_returned += val.units_returned || 0;
+      result.revenue        += val.revenue || 0;
+      result.storage_fee    += val.storage_fee || 0;
+    }
+  }
+  return result;
+}
+
+// ─── Ventas en rango de fechas ───────────────────────────────────────────────
+function getDailySalesByDateRange(pid, startDate, endDate) {
+  const result = { units_organic: 0, units_returned: 0, revenue: 0, storage_fee: 0 };
+  const start = new Date(startDate).getTime();
+  const end = new Date(endDate).getTime();
+  for (const [key, val] of Object.entries(_data.daily_sales)) {
+    if (!key.startsWith(pid)) continue;
+    const date = key.split('__')[1];
+    const t = new Date(date).getTime();
+    if (t >= start && t <= end) {
+      result.units_organic  += val.units_organic || 0;
+      result.units_returned += val.units_returned || 0;
+      result.revenue        += val.revenue || 0;
+      result.storage_fee    += val.storage_fee || 0;
+    }
+  }
+  return result;
+}
+
+// ─── Ads (por mes) ───────────────────────────────────────────────────────────
+const getMonthlyAds = (pid, m) => {
+  const key = `${pid}__${m}`;
+  return _data.monthly_ads[key] || null;
+};
 
 function upsertMonthlyAds(d) {
-  _data.monthly_ads[_k(d.product_id, d.month)] = d;
+  _data.monthly_ads[`${d.product_id}__${d.month}`] = d;
   save(_data);
 }
 
@@ -82,30 +122,15 @@ function deleteFixedCost(id) {
 // ─── Meses disponibles ────────────────────────────────────────────────────────
 function getAvailableMonths() {
   const months = new Set();
-  Object.keys(_data.monthly_sales).forEach(k => months.add(k.split('__')[1]));
-  Object.keys(_data.monthly_ads).forEach(k   => months.add(k.split('__')[1]));
-  return [...months].sort().reverse();
-}
-
-// ─── Datos de un mes ──────────────────────────────────────────────────────────
-function getMonthData(month) {
-  const products = getProducts();
-  const result   = {};
-  for (const p of products) {
-    const s = getMonthlySales(p.id, month) || {};
-    const a = getMonthlyAds(p.id, month)   || {};
-    result[p.id] = {
-      product:        p,
-      units_ads:      a.units_ads      || 0,
-      units_organic:  s.units_organic  || 0,
-      units_returned: s.units_returned || 0,
-      ppc_spend:      a.ppc_spend      || 0,
-      storage_fee:    s.storage_fee    || 0,
-      impressions:    a.impressions    || 0,
-      clicks:         a.clicks         || 0,
-    };
+  for (const key of Object.keys(_data.daily_sales)) {
+    const date = key.split('__')[1];
+    if (date) months.add(date.slice(0, 7)); // YYYY-MM
   }
-  return result;
+  for (const key of Object.keys(_data.monthly_ads)) {
+    const month = key.split('__')[1];
+    if (month) months.add(month);
+  }
+  return [...months].sort().reverse();
 }
 
 // ─── Sync ─────────────────────────────────────────────────────────────────────
@@ -125,10 +150,10 @@ const getLastSync = (type) => _data.sync_log.find(l => l.type === type) || null;
 
 module.exports = {
   getProducts, upsertProduct, deleteProduct,
-  getMonthlySales, upsertMonthlySales,
+  getDailySales, upsertDailySales, getDailySalesByMonth, getDailySalesByDateRange,
   getMonthlyAds, upsertMonthlyAds,
   getFixedCosts, upsertFixedCost, deleteFixedCost,
-  getAvailableMonths, getMonthData,
+  getAvailableMonths,
   logSync, getLastSync,
   getLastSyncDate, setLastSyncDate,
 };
